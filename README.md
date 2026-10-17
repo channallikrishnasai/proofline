@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🔍 AgentDFIR
+# 🔍 PROOFLINE
+
+*Every action leaves evidence. Every claim needs proof.*
 
 **Open-source digital forensics and incident response for AI agents.**
 
@@ -15,13 +17,13 @@
 
 </div>
 
-<p align="center"><img src="docs/img/hero-app.webp" width="900" alt="The AgentDFIR case explorer: the finding “The agent read a password or key, then sent data out”, with what happened, why it matters, the most likely start and the step-by-step story. Demo case from agentdfir simulate."></p>
+<p align="center"><img src="docs/img/hero-app.webp" width="900" alt="The PROOFLINE case explorer: the finding “The agent read a password or key, then sent data out”, with what happened, why it matters, the most likely start and the step-by-step story. Demo case from agentdfir simulate."></p>
 
 ---
 
 AI coding agents execute shell commands, edit files, spawn subagents, call MCP servers and push code. When something goes wrong — a prompt injection, a poisoned MCP tool, a rogue subagent, quiet data exfiltration — the transcripts and configs they leave on the endpoint are **primary forensic evidence**. Almost no tooling exists to acquire and analyze them properly.
 
-**AgentDFIR is that tooling.** Think KAPE / Velociraptor for the agentic-AI layer. It lets an incident responder answer:
+**PROOFLINE is that tooling, derived from AgentDFIR.** Think KAPE / Velociraptor for the agentic-AI layer. It lets an incident responder answer:
 
 > *Who instructed which AI agent/subagent to perform what action, through which tool/MCP/identity, against which resource — and what evidence proves it?*
 
@@ -39,11 +41,11 @@ AI-generated text is **never** automatically treated as proof of execution. Ever
 | `DISPROVED` | endpoint evidence shows it did **not** occur |
 | `UNKNOWN` | insufficient evidence |
 
-An agent claiming *"I executed curl example.com"* with no matching tool call stays `CLAIMED` — and AgentDFIR shows you exactly that.
+An agent claiming *"I executed curl example.com"* with no matching tool call stays `CLAIMED` — and PROOFLINE shows you exactly that.
 
 ## ⚡ Quick start — one command
 
-Nothing installed yet? Paste the line for your OS into a terminal. It installs AgentDFIR
+Nothing installed yet? Paste the line for your OS into a terminal. It installs the inherited AgentDFIR CLI
 (SHA256-verified), finds every AI agent on this machine, collects their evidence into one
 sealed package, analyzes it and opens the results in your browser. Nothing leaves your machine.
 
