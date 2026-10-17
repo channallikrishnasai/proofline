@@ -1,0 +1,279 @@
+// Package-aware detection rules (plan §14: the rule input contract is
+// the whole package — events alone cannot express these). All content
+// scans stream (see scan.go) so artifact size never causes a skip.
+package detect
+
+import (
+	"bytes"
+	"fmt"
+	"github.com/efij/AgentDFIR/v3/internal/shellshape"
+	"regexp"
+	"strings"
+
+	"github.com/efij/AgentDFIR/v3/internal/casepkg"
+	"github.com/efij/AgentDFIR/v3/internal/schema"
+)
+
+// Options tunes package-aware detection.
+type Options struct {
+	Honeytokens       []string
+	SpawnThreshold    int      // AGENT_SPAWN_EXPLOSION per-session threshold (default 10)
+	KnownDestinations []string // additional allowlisted network destinations
+}
+
+// RunPackage evaluates event rules plus package-aware rules.
+func RunPackage(res *schema.Normalized, pkgDir string) []schema.Finding {
+	return RunPackageWithOptions(res, pkgDir, nil)
+}
+
+// RunPackageWithOptions keeps the historical signature (honeytokens only).
+func RunPackageWithOptions(res *schema.Normalized, pkgDir string, honeytokens []string) []schema.Finding {
+	return RunAll(res, pkgDir, Options{Honeytokens: honeytokens})
+}
+
+// RunAll is the full deterministic rule set: event rules, package
+// content scans, and the v0.5.0 behavioral/integrity rules.
+func RunAll(res *schema.Normalized, pkgDir string, opts Options) []schema.Finding {
+	findings := Run(res)
+	man, err := readManifest(pkgDir)
+	if err == nil {
+		findings = append(findings, permissionBypass(man, pkgDir)...)
+		findings = append(findings, permissionEscalation(man, pkgDir)...)
+		findings = append(findings, contentScans(man, pkgDir, opts.Honeytokens)...)
+		findings = append(findings, behavioralRules(res, man, opts)...)
+		findings = append(findings, integrityRules(res, man)...)
+	}
+	return sortBySeverity(findings)
+}
+
+// readManifest reads the package manifest in whichever form it was
+// written (append-only manifest.jsonl, or the legacy manifest.json array).
+func readManifest(pkgDir string) (*casepkg.Manifest, error) {
+	return casepkg.ReadManifest(pkgDir)
+}
+
+func isType(a casepkg.ArtifactRecord, types ...string) bool {
+	if a.Status != casepkg.StatusOK {
+		return false
+	}
+	for _, t := range types {
+		if a.ArtifactType == t {
+			return true
+		}
+	}
+	return false
+}
+
+func artRef(a casepkg.ArtifactRecord, off int64) string {
+	return fmt.Sprintf("%s (artifact %.12s, byte offset %d)", a.LogicalPath, a.ArtifactID, off)
+}
+
+// bypassMarkers are config values that disable permission/sandbox controls.
+var bypassMarkers = []string{
+	`"defaultMode": "bypassPermissions"`,
+	`"defaultMode":"bypassPermissions"`,
+	`"dangerouslySkipPermissions"`,
+	`approval_policy = "never"`,
+	`sandbox_mode = "danger-full-access"`,
+	`"yolo": true`,
+	`"yolo":true`,
+}
+
+// PERMISSION_BYPASS_ENABLED — configuration disables permission prompting
+// or sandboxing entirely.
+func permissionBypass(man *casepkg.Manifest, pkgDir string) []schema.Finding {
+	var out []schema.Finding
+	store := casepkg.NewStore(pkgDir, man)
+	for _, a := range man.Current() {
+		if !isType(a, "product_config", "managed_config") {
+			continue
+		}
+		marker, off, ok := scanContains(blobReader{store, a.ArtifactID}, bypassMarkers)
+		if !ok {
+			continue
+		}
+		out = append(out, schema.Finding{
+			RuleID:        "PERMISSION_BYPASS_ENABLED",
+			Severity:      "HIGH",
+			Title:         "Permission/Sandbox Controls Disabled",
+			Description:   "Collected configuration disables permission prompting or sandboxing: " + marker,
+			EvidenceRefs:  []string{artRef(a, off)},
+			Status:        schema.StateObserved,
+			Endpoint:      schema.StateUnknown,
+			MitreATTACK:   "T1562.001", // Impair Defenses: Disable or Modify Tools
+			MitreATLAS:    "AML.T0081", // Modify AI Agent Configuration
+			FalsePositive: "Developers legitimately enable bypass modes on trusted machines; assess against org policy.",
+		})
+	}
+	return out
+}
+
+// escalationMarkers grant blanket tool permissions without per-command review.
+var escalationMarkers = []string{`"Bash(*)"`, `"Bash(*:*)"`, `"allow": ["*"]`, `"allow":["*"]`, `"Bash"`}
+
+// PERMISSION_ESCALATION — blanket allow rules.
+func permissionEscalation(man *casepkg.Manifest, pkgDir string) []schema.Finding {
+	var out []schema.Finding
+	store := casepkg.NewStore(pkgDir, man)
+	for _, a := range man.Current() {
+		if !isType(a, "product_config", "managed_config") {
+			continue
+		}
+		marker, off, ok := scanContains(blobReader{store, a.ArtifactID}, escalationMarkers)
+		if !ok {
+			continue
+		}
+		out = append(out, schema.Finding{
+			RuleID:        "PERMISSION_ESCALATION",
+			Severity:      "MEDIUM",
+			Title:         "Blanket Tool Permission Granted",
+			Description:   "Configuration grants wildcard/blanket tool permission (" + marker + "), removing per-command review.",
+			EvidenceRefs:  []string{artRef(a, off)},
+			Status:        schema.StateObserved,
+			Endpoint:      schema.StateUnknown,
+			MitreATTACK:   "T1562.001",
+			MitreATLAS:    "AML.T0081",
+			FalsePositive: "Intentional on sandboxed CI hosts; compare against the org baseline (agentdfir baseline check).",
+		})
+	}
+	return out
+}
+
+// secretPattern is one well-known credential format. lit is a literal
+// that every match contains at its start (after the leading word
+// boundary); the streaming scan looks for it with a byte search and runs
+// the regex only around each occurrence. Go's regexp falls back to its
+// NFA on megabyte chunks, and on a 2 GB transcript set that was 197 s of
+// CPU for this one rule.
+type secretPattern struct {
+	name string
+	lit  string
+	re   *regexp.Regexp
+}
+
+// secretPatterns match well-known credential formats. Values are NEVER
+// included in findings — category, artifact and offset only (plan §18).
+var secretPatterns = []secretPattern{
+	{"AWS_ACCESS_KEY", "AKIA", regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
+	{"GITHUB_TOKEN", "ghp_", regexp.MustCompile(`\bghp_[A-Za-z0-9]{36}\b`)},
+	{"GITHUB_FINE_GRAINED_TOKEN", "github_pat_", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{22,}\b`)},
+	{"SLACK_TOKEN", "xox", regexp.MustCompile(`\bxox[bpars]-[A-Za-z0-9-]{10,}\b`)},
+	{"ANTHROPIC_API_KEY", "sk-ant-", regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{20,}\b`)},
+	{"OPENAI_API_KEY", "sk-", regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}\b`)},
+	{"GOOGLE_API_KEY", "AIza", regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}\b`)},
+	{"ALIBABA_ACCESS_KEY", "LTAI", regexp.MustCompile(`\bLTAI[0-9A-Za-z]{12,20}\b`)},
+	{"TENCENT_SECRET_ID", "AKID", regexp.MustCompile(`\bAKID[0-9A-Za-z]{32}\b`)},
+	{"PRIVATE_KEY_BLOCK", "-----BEGIN ", regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)},
+	{"JWT", "eyJ", regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)},
+}
+
+// placeholderMarks are the substrings vendors and docs use for example
+// credentials. On a real machine 92 of 95 HIGH secret findings were the
+// AWS documentation key `AKIAIOSFODNN7EXAMPLE`, `AKIAFAKE…`, `xoxb-123…XXXX`
+// and the like: text that passed through the model, but not a secret.
+var placeholderMarks = []string{"EXAMPLE", "FAKE", "XXXX", "SAMPLE", "PLACEHOLDER", "DUMMY", "TEST", "1234567890", "ABCDEF", "REDACTED"}
+
+// isPlaceholderSecret reports whether a matched credential-shaped value is
+// a documented example rather than key material. Private-key headers are
+// never placeholders by this test: the header alone says nothing.
+func isPlaceholderSecret(m []byte) bool {
+	if len(m) == 0 || bytes.HasPrefix(m, []byte("-----BEGIN")) {
+		return false
+	}
+	up := strings.ToUpper(string(m))
+	for _, mark := range placeholderMarks {
+		if strings.Contains(up, mark) {
+			return true
+		}
+	}
+	return hasRepeatedRun(m, 6)
+}
+
+// privateKeyHasBody reports whether PEM material follows a private-key
+// header: a run of base64 before the END marker. Summaries and docs write
+// `-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----`;
+// 25 of 27 remaining HIGH private-key findings on a real machine had that
+// shape. A header at the very end of the window is kept: unknown is not
+// benign.
+func privateKeyHasBody(after []byte) bool {
+	if len(after) > 400 {
+		after = after[:400]
+	}
+	if len(after) < 24 {
+		return true
+	}
+	end := bytes.Index(after, []byte("-----END"))
+	body := after
+	if end >= 0 {
+		body = after[:end]
+	}
+	run := 0
+	for _, c := range body {
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '+', c == '/', c == '=':
+			run++
+			if run >= 20 {
+				return true
+			}
+		default:
+			run = 0
+		}
+	}
+	return end < 0 && len(body) < 40 // header ran into the window edge: keep it
+}
+
+// hasRepeatedRun reports whether m contains n identical bytes in a row
+// (`XXXXXX`, `000000`), the way placeholder keys pad their bodies.
+func hasRepeatedRun(m []byte, n int) bool {
+	run := 1
+	for i := 1; i < len(m); i++ {
+		if m[i] == m[i-1] {
+			run++
+			if run >= n {
+				return true
+			}
+		} else {
+			run = 1
+		}
+	}
+	return false
+}
+
+// SecretKind classifies a value against the well-known credential formats
+// and returns the category name (never the value). Used by the MCP audit
+// for inline env/header values in server configs.
+func SecretKind(value string) (string, bool) {
+	for _, p := range secretPatterns {
+		if p.re.MatchString(value) {
+			return p.name, true
+		}
+	}
+	return "", false
+}
+
+// POTENTIAL_SECRET_EXPOSURE — credential material inside agent
+// conversations (it passed through the model provider) — is raised by
+// contentScans, which streams each transcript once for every content rule.
+
+// sensitivePathRe flags reads of well-known credential/config locations.
+var sensitivePathRe = regexp.MustCompile(`(?i)(\.ssh/|id_rsa|id_ed25519|authorized_keys|\.aws/credentials|\.netrc|\.kube/config|/etc/shadow|\.gnupg/|\.npmrc|\.pypirc|\.docker/config\.json|\.env\b|keychain|wallet\.dat|\.gcloud/|\.azure/|credentials\.json|token\.json)`)
+
+func containsSensitivePath(s string) (string, bool) {
+	// Heredoc bodies are files being written, not paths being read, and
+	// template env files (.env.example, .env.sample…) hold no secrets.
+	s = envTemplateRe.ReplaceAllString(shellshape.StripAllHeredocs(s), "")
+	m := sensitivePathRe.FindString(s)
+	return m, m != ""
+}
+
+var envTemplateRe = regexp.MustCompile(`(?i)\.env\.(example|sample|template|dist|defaults?|tpl)\b`)
+
+func lowerHas(s string, subs ...string) bool {
+	l := strings.ToLower(s)
+	for _, sub := range subs {
+		if strings.Contains(l, sub) {
+			return true
+		}
+	}
+	return false
+}

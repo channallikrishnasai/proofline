@@ -1,0 +1,357 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v2.3.0)."
+        required: true
+        type: string
+      build:
+        description: "Build, sign and publish. Leave off to only re-verify an already-published tag."
+        required: false
+        default: false
+        type: boolean
+      chocolatey:
+        description: "Publish this already-released tag to Chocolatey only (no rebuild); for seeding or retrying the feed."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write # Sigstore keyless signing (cosign)
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  # ------------------------------------------------------------------ build
+  build:
+    # A tag push is the normal trigger. The dispatch-with-build path is how
+    # auto-release.yml starts a release: a tag pushed by GITHUB_TOKEN does not
+    # trigger a `push` workflow (GitHub blocks that to stop recursion), so the
+    # tag is created there and this is dispatched against it. Dispatching
+    # against the tag ref keeps the Sigstore certificate identity exactly what
+    # a tag push produces — `release.yml@refs/tags/vX.Y.Z` — so the
+    # verification command in docs/install.md stays true for every release
+    # however it was started.
+    if: github.event_name == 'push' || inputs.build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build release assets
+        run: scripts/release-build.sh "${RELEASE_TAG}" dist
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign assets (Sigstore keyless, GitHub OIDC)
+        # One .sigstore.json bundle per asset. Bundles embed the certificate and
+        # the Rekor transparency-log entry, so they verify offline (air-gap).
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in agentdfir-* SHA256SUMS.txt; do
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
+          ls -la
+
+      - name: Publish release
+        # gh CLI instead of a marketplace action: idempotent (re-runs replace
+        # assets), sequential uploads, and the asset count is asserted before
+        # the draft is published.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG exists; replacing assets"
+          else
+            gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --draft --generate-notes --title "$RELEASE_TAG"
+          fi
+          for f in dist/*; do
+            gh release upload "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --clobber "$f"
+          done
+          want=$(ls dist | wc -l | tr -d ' ')   # binaries + archives + SHA256SUMS + one bundle each
+          have=$(gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets|length')
+          echo "assets: have=$have want=$want"
+          [ "$have" -eq "$want" ] || { echo "asset count mismatch"; exit 1; }
+          gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --draft=false
+
+  # ----------------------------------------------------------------- verify
+  # Downloads the *published* assets the way a user would and runs the exact
+  # steps documented in docs/install.md. "Verified" means the user path works,
+  # not that a curl in a shell worked.
+  verify:
+    needs: build
+    # Runs after a successful build (tag push) or standalone via
+    # workflow_dispatch against an already-published tag (build skipped).
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cosign
+        if: runner.os != 'Windows'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Portable binary path (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$RELEASE_TAG"
+          case "$RUNNER_OS" in macOS) os=darwin ;; Linux) os=linux ;; esac
+          case "$(uname -m)" in x86_64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; esac
+          A="agentdfir-$V-$os-$arch"
+          mkdir rel && cd rel
+          gh release download "$V" -R "$GITHUB_REPOSITORY" -p "$A" -p "$A.sigstore.json" -p SHA256SUMS.txt -p SHA256SUMS.txt.sigstore.json
+
+          echo "== checksum"
+          grep -E "[[:space:]]\*?$A\$" SHA256SUMS.txt > sum.txt
+          if command -v sha256sum >/dev/null; then sha256sum -c sum.txt; else shasum -a 256 -c sum.txt; fi
+
+          echo "== provenance (cosign, offline bundle)"
+          ID="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$V"
+          for f in "$A" SHA256SUMS.txt; do
+            cosign verify-blob --bundle "$f.sigstore.json" \
+              --certificate-identity "$ID" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --offline "$f"
+          done
+
+          echo "== run"
+          chmod +x "$A"
+          ./"$A" version | tee out.txt
+          grep -F "agentdfir $V" out.txt
+
+      - name: macOS browser-download path (quarantine → xattr -d → runs)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/gatekeeper-check.sh "rel/agentdfir-$RELEASE_TAG-darwin-$(uname -m | sed 's/x86_64/amd64/')" "agentdfir $RELEASE_TAG"
+
+      - name: install.sh path (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          AGENTDFIR_VERSION="$RELEASE_TAG" AGENTDFIR_INSTALL_DIR="$PWD/ibin" sh install.sh
+          ./ibin/agentdfir version | grep -F "agentdfir $RELEASE_TAG"
+
+      - name: Windows zip + raw exe path (mark-of-the-web applied)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $V = $env:RELEASE_TAG
+          $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+          $other = if ($arch -eq 'arm64') { 'amd64' } else { 'arm64' }
+          $zip = "agentdfir-$V-windows-$arch.zip"
+          $exe = "agentdfir-$V-windows-$arch.exe"
+          $otherExe = "agentdfir-$V-windows-$other.exe"   # published for the other CPU; checksummed, not run
+          New-Item -ItemType Directory rel | Out-Null
+          Set-Location rel
+          gh release download $V -R $env:GITHUB_REPOSITORY -p $zip -p $exe -p $otherExe -p SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+
+          Write-Host "== checksums"
+          foreach ($f in @($zip, $exe, $otherExe)) {
+            $actual = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            $line = Select-String -Path SHA256SUMS.txt -Pattern ("\s\*?" + [regex]::Escape($f) + "$") | Select-Object -First 1
+            if (-not $line) { throw "$f not in SHA256SUMS.txt" }
+            $expected = ($line.Line -split '\s+')[0].ToLower()
+            if ($actual -ne $expected) { throw "checksum mismatch for $f" }
+            Write-Host "ok $f $actual"
+          }
+
+          Write-Host "== mark-of-the-web (what a browser download carries)"
+          Expand-Archive $zip -DestinationPath x
+          # ".\" prefix: PowerShell does not run a bare filename from the working directory.
+          foreach ($p in @(".\x\agentdfir.exe", ".\$exe")) {
+            Set-Content -Path $p -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+            $out = & $p version
+            if ($LASTEXITCODE -ne 0) { throw "$p exited $LASTEXITCODE" }
+            if ($out -notmatch [regex]::Escape("agentdfir $V")) { throw "unexpected output: $out" }
+            Write-Host "ok $p -> $out"
+          }
+
+      - name: Windows install.ps1 (the documented one-liner, against the published release)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:AGENTDFIR_VERSION = $env:RELEASE_TAG
+          $env:AGENTDFIR_INSTALL_DIR = "$PWD\ibin"
+          irm "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:RELEASE_TAG/install.ps1" | iex
+          $out = & agentdfir version    # resolves through the PATH install.ps1 just set
+          if ($out -notmatch [regex]::Escape("agentdfir $env:RELEASE_TAG")) { throw "unexpected output: $out" }
+          Write-Host "ok install.ps1 -> $out"
+
+  # --------------------------------------------------------------- homebrew
+  # Refreshes efij/homebrew-agentdfir. Auth: HOMEBREW_TAP_SSH_KEY (private key
+  # of a write deploy key on the tap repo) or HOMEBREW_TAP_TOKEN (contents:write
+  # PAT). Without either the release FAILS visibly: a green release with a stale
+  # `brew upgrade` is worse than a red one.
+  homebrew:
+    needs: verify
+    runs-on: ubuntu-latest
+    if: ${{ (github.event_name == 'push' || inputs.build) && needs.verify.result == 'success' && !contains(github.ref_name, '-') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update tap formula
+        env:
+          TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_SSH_KEY:-}" ] && [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::error::neither HOMEBREW_TAP_SSH_KEY nor HOMEBREW_TAP_TOKEN is set — Homebrew users would stay on the previous version."
+            echo "Fix: add a write deploy key on efij/homebrew-agentdfir and store its private key as repo secret HOMEBREW_TAP_SSH_KEY,"
+            echo "then re-run this job, or publish by hand: scripts/update-tap.sh $RELEASE_TAG"
+            exit 1
+          fi
+          scripts/update-tap.sh "$RELEASE_TAG"
+      - name: Verify tap serves this version
+        run: |
+          set -euo pipefail
+          got=$(curl -fsSL "https://raw.githubusercontent.com/efij/homebrew-agentdfir/main/Formula/agentdfir.rb" | grep -oE 'tags/v[0-9]+(\.[0-9]+)+' | head -1 | sed 's#tags/##')
+          if [ "$got" != "$RELEASE_TAG" ]; then
+            echo "::error::tap formula points at ${got:-nothing}, expected $RELEASE_TAG"; exit 1
+          fi
+          echo "tap formula at $RELEASE_TAG"
+
+  # ------------------------------------------------------------------ scoop
+  # Refreshes efij/scoop-agentdfir (Windows). Same contract as homebrew:
+  # SCOOP_BUCKET_SSH_KEY (write deploy key on the bucket repo) or
+  # SCOOP_BUCKET_TOKEN; without either the release FAILS visibly.
+  scoop:
+    needs: verify
+    runs-on: ubuntu-latest
+    if: ${{ (github.event_name == 'push' || inputs.build) && needs.verify.result == 'success' && !contains(github.ref_name, '-') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update bucket manifest
+        env:
+          BUCKET_SSH_KEY: ${{ secrets.SCOOP_BUCKET_SSH_KEY }}
+          BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BUCKET_SSH_KEY:-}" ] && [ -z "${BUCKET_TOKEN:-}" ]; then
+            echo "::error::neither SCOOP_BUCKET_SSH_KEY nor SCOOP_BUCKET_TOKEN is set — Scoop users would stay on the previous version."
+            echo "Fix: add a write deploy key on efij/scoop-agentdfir and store its private key as repo secret SCOOP_BUCKET_SSH_KEY,"
+            echo "then re-run this job, or publish by hand: scripts/update-scoop.sh $RELEASE_TAG"
+            exit 1
+          fi
+          scripts/update-scoop.sh "$RELEASE_TAG"
+      - name: Verify bucket serves this version
+        run: |
+          set -euo pipefail
+          got=$(curl -fsSL "https://raw.githubusercontent.com/efij/scoop-agentdfir/main/bucket/agentdfir.json" | python3 -c 'import json,sys; print("v"+json.load(sys.stdin)["version"])')
+          if [ "$got" != "$RELEASE_TAG" ]; then
+            echo "::error::bucket manifest at ${got:-nothing}, expected $RELEASE_TAG"; exit 1
+          fi
+          echo "bucket manifest at $RELEASE_TAG"
+
+  # ------------------------------------------------------------- chocolatey
+  # Publishes the package to the Chocolatey community feed. Only choco.exe can
+  # pack and push, so this runs on Windows; the rendered package source is
+  # committed to efij/chocolatey-agentdfir by the next job, from Linux, with
+  # the same deploy-key contract as the tap and the bucket. The feed API key
+  # (secret CHOCO_API_KEY) is read by `choco push` alone and never written to
+  # disk or to the log. Without the key the release FAILS visibly, like the
+  # other channels. First-time submissions sit in Chocolatey moderation before
+  # `choco install agentdfir` resolves them; that is the feed's rule, not a
+  # failure here.
+  chocolatey:
+    needs: verify
+    runs-on: windows-latest
+    # !cancelled() is load-bearing: without a status function GitHub prepends
+    # success(), which is false whenever any job in the needs chain was
+    # skipped - and on a chocolatey-only dispatch `build` is skipped. Every
+    # probe without it was skipped even with verify green.
+    if: ${{ !cancelled() && (github.event_name == 'push' || inputs.build || inputs.chocolatey) && (needs.verify.result == 'success' || needs.verify.result == 'skipped') && !contains(github.ref_name, '-') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render package source
+        shell: bash
+        run: scripts/update-choco.sh "$RELEASE_TAG" --render-only pkg
+      - name: Pack
+        shell: pwsh
+        run: |
+          choco pack pkg/agentdfir.nuspec --outputdirectory pkg
+          Get-ChildItem pkg/*.nupkg
+      - name: Push to the community feed
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          if (-not $env:CHOCO_API_KEY) {
+            Write-Host "::error::CHOCO_API_KEY is not set - Chocolatey users would stay on the previous version."
+            Write-Host "Fix: store the community-feed API key as repo secret CHOCO_API_KEY and re-run this job, or dispatch this workflow with chocolatey=true."
+            exit 1
+          }
+          $ver = $env:RELEASE_TAG.TrimStart('v')
+          $pkg = "pkg/agentdfir.$ver.nupkg"
+          $out = & choco push $pkg --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          # Never echo the command line; the key is in it. The output itself is safe.
+          Write-Host $out
+          if ($code -ne 0) {
+            if ($out -match 'already exists|409') { Write-Host "agentdfir $ver is already on the feed"; exit 0 }
+            Write-Host "::error::choco push failed with exit code $code"
+            exit $code
+          }
+      - name: Verify the feed knows this version
+        shell: pwsh
+        run: |
+          $ver = $env:RELEASE_TAG.TrimStart('v')
+          $url = "https://community.chocolatey.org/api/v2/Packages()?`$filter=Id%20eq%20'agentdfir'%20and%20Version%20eq%20'$ver'"
+          try {
+            $body = (Invoke-WebRequest -UseBasicParsing -Uri $url).Content
+            if ($body -match '<entry>') { Write-Host "feed lists agentdfir $ver" } else { Write-Host "::warning::agentdfir $ver accepted by the push endpoint but not yet listed (moderation queue)" }
+          } catch { Write-Host "::warning::feed query failed: $_" }
+
+  chocolatey-source:
+    needs: chocolatey
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && needs.chocolatey.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit rendered package source
+        env:
+          CHOCO_REPO_SSH_KEY: ${{ secrets.CHOCO_REPO_SSH_KEY }}
+          CHOCO_REPO_TOKEN: ${{ secrets.CHOCO_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CHOCO_REPO_SSH_KEY:-}" ] && [ -z "${CHOCO_REPO_TOKEN:-}" ]; then
+            echo "::error::neither CHOCO_REPO_SSH_KEY nor CHOCO_REPO_TOKEN is set — the published package would have no auditable source."
+            echo "Fix: add a write deploy key on efij/chocolatey-agentdfir and store its private key as repo secret CHOCO_REPO_SSH_KEY,"
+            echo "then re-run this job, or publish by hand: scripts/update-choco.sh $RELEASE_TAG"
+            exit 1
+          fi
+          scripts/update-choco.sh "$RELEASE_TAG"
+      - name: Verify source repo serves this version
+        run: |
+          set -euo pipefail
+          got=$(curl -fsSL "https://raw.githubusercontent.com/efij/chocolatey-agentdfir/main/agentdfir.nuspec" | grep -oE '<version>[^<]+' | sed 's/<version>/v/')
+          if [ "$got" != "$RELEASE_TAG" ]; then
+            echo "::error::package source at ${got:-nothing}, expected $RELEASE_TAG"; exit 1
+          fi
+          echo "package source at $RELEASE_TAG"

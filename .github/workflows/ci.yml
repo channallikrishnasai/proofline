@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: gofmt
+        if: runner.os != 'Windows'
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build -trimpath ./...
+      - name: test
+        run: go test -race ./...
+
+  # Builds the release asset layout and runs the documented install paths
+  # against it, so a broken install.sh or a renamed asset fails the PR, not the
+  # release. Mirrors the `verify` job in release.yml minus the download.
+  release-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: build release assets
+        run: scripts/release-build.sh v0.0.0-ci dist
+      - name: install.sh against local assets
+        run: |
+          set -euo pipefail
+          AGENTDFIR_VERSION=v0.0.0-ci AGENTDFIR_BASE_URL="file://$PWD/dist" \
+            AGENTDFIR_INSTALL_DIR="$PWD/ibin" sh install.sh
+          ./ibin/agentdfir version | grep -F "agentdfir v0.0.0-ci"
+      - name: checksum file verifies
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null; then sha256sum -c SHA256SUMS.txt; else shasum -a 256 -c SHA256SUMS.txt; fi
+      - name: macOS browser-download path (quarantine → xattr -d → runs)
+        if: runner.os == 'macOS'
+        run: bash scripts/gatekeeper-check.sh "dist/agentdfir-v0.0.0-ci-darwin-$(uname -m | sed 's/x86_64/amd64/')" "agentdfir v0.0.0-ci"
+
+  release-smoke-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: build both Windows binaries in the release layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory dist | Out-Null
+          $ld = "-s -w -X github.com/efij/AgentDFIR/v3/internal/version.Version=v0.0.0-ci"
+          foreach ($a in @('amd64', 'arm64')) {
+            $env:GOOS = 'windows'; $env:GOARCH = $a; $env:CGO_ENABLED = '0'
+            go build -trimpath -ldflags $ld -o "dist/agentdfir-v0.0.0-ci-windows-$a.exe" ./cmd/agentdfir
+            if ($LASTEXITCODE -ne 0) { throw "build windows/$a failed" }
+          }
+          Get-ChildItem dist -Filter *.exe | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+      - name: install.ps1 against local assets (the documented one-liner, offline)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:AGENTDFIR_VERSION = 'v0.0.0-ci'
+          $env:AGENTDFIR_BASE_URL = 'file:///' + ($PWD.Path -replace '\\', '/') + '/dist'
+          $env:AGENTDFIR_INSTALL_DIR = "$PWD\ibin"
+          Get-Content -Raw .\install.ps1 | Invoke-Expression
+          $out = & agentdfir version
+          if ($out -notmatch 'agentdfir v0\.0\.0-ci') { throw "unexpected output: $out" }
+          if (-not (Test-Path "$PWD\ibin\agentdfir.exe")) { throw "agentdfir.exe not installed" }
+          Write-Host "ok $out"
+      # The documented Windows one-liner has to survive three shells: cmd.exe,
+      # Windows PowerShell 5.1 and PowerShell 7. It is written without `$` so
+      # an outer PowerShell expands nothing inside the quotes, and `|` sits
+      # inside the quotes so cmd does not pipe. These steps paste the same
+      # shape into each shell (offline assets; env set the documented way).
+      - name: one-liner shape from cmd.exe
+        shell: cmd
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "[Environment]::SetEnvironmentVariable('AGENTDFIR_VERSION','v0.0.0-ci'); [Environment]::SetEnvironmentVariable('AGENTDFIR_BASE_URL','file:///'+((Join-Path (Get-Location) 'dist') -replace '\\','/')); [Environment]::SetEnvironmentVariable('AGENTDFIR_INSTALL_DIR',(Join-Path (Get-Location) 'ibin-cmd')); Get-Content -Raw .\install.ps1 | iex"
+          if errorlevel 1 exit /b 1
+          ibin-cmd\agentdfir.exe version | findstr /c:"agentdfir v0.0.0-ci" || exit /b 1
+      - name: one-liner shape from Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "[Environment]::SetEnvironmentVariable('AGENTDFIR_VERSION','v0.0.0-ci'); [Environment]::SetEnvironmentVariable('AGENTDFIR_BASE_URL','file:///'+((Join-Path (Get-Location) 'dist') -replace '\\','/')); [Environment]::SetEnvironmentVariable('AGENTDFIR_INSTALL_DIR',(Join-Path (Get-Location) 'ibin-ps5')); Get-Content -Raw .\install.ps1 | iex"
+          if ($LASTEXITCODE -ne 0) { throw "install failed" }
+          $out = & .\ibin-ps5\agentdfir.exe version
+          if ($out -notmatch 'agentdfir v0\.0\.0-ci') { throw "unexpected output: $out" }
+      - name: one-liner shape from PowerShell 7
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "[Environment]::SetEnvironmentVariable('AGENTDFIR_VERSION','v0.0.0-ci'); [Environment]::SetEnvironmentVariable('AGENTDFIR_BASE_URL','file:///'+((Join-Path (Get-Location) 'dist') -replace '\\','/')); [Environment]::SetEnvironmentVariable('AGENTDFIR_INSTALL_DIR',(Join-Path (Get-Location) 'ibin-pwsh')); Get-Content -Raw .\install.ps1 | iex"
+          if ($LASTEXITCODE -ne 0) { throw "install failed" }
+          $out = & .\ibin-pwsh\agentdfir.exe version
+          if ($out -notmatch 'agentdfir v0\.0\.0-ci') { throw "unexpected output: $out" }
